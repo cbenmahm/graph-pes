@@ -437,7 +437,7 @@ class GraphPESModel(GraphPropertyModel):
                 "torch_sim is not installed. Please install it using "
                 "pip install torch-sim-atomistic"
             )
-        from torch_sim.models.graphpes import GraphPESWrapper
+        from graph_pes.torch_sim import GraphPESWrapper
 
         return GraphPESWrapper(
             self.eval(),
