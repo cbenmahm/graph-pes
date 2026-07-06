@@ -579,6 +579,9 @@ class _BaseTensorMACE(GraphTensorModel):
         )
         node_attributes = self.node_attribute_generator(graph.Z)
 
+        # initialize feature storage
+        node_features_all = []
+
         # generate initial node features
         node_features = self.initial_node_embedding(graph.Z)
 
@@ -592,6 +595,7 @@ class _BaseTensorMACE(GraphTensorModel):
                 edge_features,
                 graph,
             )
+            node_features_all.append(node_features)
             per_atom_tensors.append(readout(node_features).squeeze(-1))
 
         # stack the per-atom atomic tensors
@@ -600,8 +604,11 @@ class _BaseTensorMACE(GraphTensorModel):
         )
         atomic_tensors = self.scaler(atomic_tensors, graph)
 
+        # concatenate all features
+        node_features_all = torch.cat(node_features_all, dim=-1)
         preds: dict[PropertyKey, torch.Tensor] = {
-            self.implemented_properties: atomic_tensors
+            self.implemented_properties: atomic_tensors,
+            "node_features": node_features_all,
         }
 
         # return scaled local energy predictions

@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import time
 import warnings
-from typing import Iterable, TypeVar, overload
+from typing import Iterable, Literal, TypeVar, overload
 
 import ase
 import numpy
 import torch
 from ase.calculators.calculator import Calculator, all_changes
 from ase.stress import full_3x3_to_voigt_6_stress
+from e3nn import o3
 
 from graph_pes.atomic_graph import (
     AtomicGraph,
@@ -17,6 +18,7 @@ from graph_pes.atomic_graph import (
     to_batch,
 )
 from graph_pes.graph_pes_model import GraphPESModel
+from graph_pes.graph_property_model import GraphTensorModel
 from graph_pes.utils.misc import groups_of, pairs, uniform_repr
 
 
@@ -315,6 +317,104 @@ class GraphPESCalculator(Calculator):
             skin=self.skin,
         )
 
+    def get_descriptors(
+        self,
+        atoms: ase.Atoms | None = None,
+        layer_index: int | None = None,
+        num_layers=-1,
+        l: int | None = None,
+        parity: Literal["e", "o"] | None = "e",
+    ):
+        if not isinstance(self.model, GraphTensorModel):
+            raise NotImplementedError(
+                "'get_descriptors' is not implemented for this model."
+            )
+
+        if atoms is None and self.atoms is None:
+            raise ValueError("atoms not set")
+        if atoms is None:
+            atoms = self.atoms
+
+        if isinstance(layer_index, int) and num_layers != -1:
+            raise ValueError(
+                "you can't choose both layer index and the number of layers"
+            )
+
+        # build the graph
+        graph = AtomicGraph.from_ase(
+            atoms, self.model.cutoff.item() + self.skin
+        ).to(self.model.device)
+
+        with torch.no_grad():
+            features = self.model(graph)["node_features"]
+
+        layer_dims = [layer.irreps_out.dim for layer in self.model.layers]
+        n_layers = len(layer_dims)
+
+        # default behavior
+        if num_layers == -1:
+            num_layers = n_layers
+
+        if num_layers < 1 or num_layers > n_layers:
+            raise ValueError(
+                f"""num_layers must be between 1 and {n_layers}, 
+                or -1"""
+            )
+
+        # if layer_index is not None:
+        #     if layer_index < 0:
+        #         layer_index += n_layers
+
+        #     if layer_index < 0 or layer_index >= n_layers:
+        #        raise IndexError(f"layer_index must be in [0, {n_layers - 1}]")
+
+        #     start_layer = layer_index
+        #     end_layer = layer_index + 1
+        # else:
+        #     start_layer = 0
+        #     end_layer = num_layers
+
+        # start = sum(layer_dims[:start_layer])
+        # end = sum(layer_dims[:end_layer])
+
+        # return features[:, start:end].detach().cpu().numpy()
+
+        if layer_index is not None:
+            if layer_index < 0:
+                layer_index += n_layers
+            if layer_index < 0 or layer_index >= n_layers:
+                raise IndexError(f"layer_index must be in [0, {n_layers - 1}]")
+
+            start = sum(layer_dims[:layer_index])
+            end = start + layer_dims[layer_index]
+            feats = features[:, start:end]
+            if l is not None:
+                feats = select_irrep_features(
+                    feats,
+                    self.model.layers[layer_index].irreps_out,
+                    l,
+                    parity,
+                )
+
+            return feats.detach().cpu().numpy()
+
+        selected: list[torch.Tensor] = []
+
+        for i, layer in enumerate(self.model.layers):
+            start = sum(layer_dims[:i])
+            end = start + layer_dims[i]
+            feats = features[:, start:end]
+            if l is not None:
+                feats = select_irrep_features(
+                    feats, layer.irreps_out, l, parity
+                )
+            selected.append(feats)
+        feats = (
+            torch.cat(selected, dim=-1) if len(selected) > 1 else selected[0]
+        )
+
+        return feats.detach().cpu().numpy()
+
 
 ## utils ##
 
@@ -413,3 +513,31 @@ def merge_predictions(
             merged[key] = cat([p[key] for p in predictions])  # type: ignore
 
     return merged
+
+
+def select_irrep_features(
+    feats: torch.Tensor,
+    irreps: o3.Irreps,
+    l: int,
+    parity: Literal["e", "o"] | None = None,
+) -> torch.Tensor:
+    """
+    Keep only the blocks in `node featues` whose irrep has angular momentum `l`
+    and, optionally, the requested parity.
+    """
+    pieces: list[torch.Tensor] = []
+    offset = 0
+    for mul, ir in irreps:
+        block_dim = mul * ir.dim
+        keep = ir.l == l and (
+            parity is None
+            or (parity == "e" and ir.p == 1)
+            or (parity == "o" and ir.p == -1)
+        )
+        if keep:
+            pieces.append(feats[:, offset : offset + block_dim])
+        offset += block_dim
+    if not pieces:
+        raise ValueError(f"No features found for l={l}, parity={parity!r}")
+
+    return torch.cat(pieces, dim=-1)
